@@ -1,0 +1,397 @@
+# 🍱 Lunchbox Admin — Complete System Design & Limits Reference
+
+---
+
+## 1. Architecture Overview
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                  ADMIN WEB DASHBOARD (Browser)                 │
+│   index.html + project/js/*.js + project/css/admin.css         │
+│   Hosted on: Netlify (Static)                                  │
+└───────────────┬──────────────────────┬─────────────────────────┘
+                │                      │
+      Firebase SDK (client)    Netlify Serverless Functions
+                │               /.netlify/functions/*
+         ┌──────┴──────┐               │
+   Firebase Auth   Firestore      ┌────┴──────────────┐
+   (login/session)  (live data)   Supabase PostgreSQL
+                                  (historical archive)
+```
+
+The system uses a **hybrid database architecture**:
+- **Firebase Firestore** — real-time operational data (today's deliveries, agents, customers, live messages)
+- **Supabase PostgreSQL** — cold historical archive (past days' deliveries after daily reset)
+- **Netlify Functions** — serverless bridge between the admin dashboard and Supabase (auth-protected API endpoints)
+
+---
+
+## 2. Firestore Collections & Structure
+
+| Collection | Purpose | Document Schema |
+|---|---|---|
+| `users` | Delivery agent accounts | `name, email, phone, role, zone, maxDeliveries, fcmToken, totalDeliveries, completedDeliveries, onDuty, lastOnlineAt, lastOfflineAt` |
+| `deliveries` | **Today's live delivery jobs** | `customerName, customerPhone, boxId, pickupLocation, deliveryAddress, assignedTo, assignedName, agentPhone, status, pickupOrder, deliveryDate, timestamp, wasDelayed, itemCount, notes, customerId` |
+| `customers` | Master customer/subscription list | `name, phone, boxId, zone, pickupLocation, deliveryAddress, notes, itemCount, active, assignedAgent, routeOrder` |
+| `history/{date}/deliveries` | **Legacy archive** (pre-Supabase) — Firestore sub-collections per date | Same schema as `deliveries` |
+| `history/{date}/summary/stats` | Daily summary stats | `totalDeliveries, delivered, delayed, pending, completionRate, archivedAt` |
+| `nobox_requests` | Customer opt-outs (no box tomorrow) | `customerId, date, reason, timestamp` |
+| `inbox/{convId}/messages` | Customer→Admin chat messages | `text, from, timestamp, read` |
+| `config/app` | System config (PIN, reset dates) | `customerPin, lastAutoReset, lastAutoAssign` |
+| `admin_notifications` | In-app admin alerts | `message, type, timestamp, read` |
+
+> **Daily operational data lives ONLY in `deliveries`** — filtered by `deliveryDate == today`. The real-time listener (`onSnapshot`) fires instantly on any status change by any agent.
+
+---
+
+## 3. Supabase PostgreSQL Tables
+
+| Table | Purpose |
+|---|---|
+| `archived_deliveries` | All deliveries moved out of Firestore after daily reset. Primary key = `id` (Firestore doc ID). Unique constraint prevents duplicate inserts. |
+| `daily_summary` | One row per calendar day: `total_deliveries, delivered, delayed, pending, completion_rate, archived_at`. Unique constraint on `archive_date`. |
+
+### Supabase Schema (archived_deliveries)
+```sql
+id               TEXT PRIMARY KEY,
+archive_date     DATE NOT NULL,
+customer_id      TEXT,
+customer_name    TEXT,
+customer_phone   TEXT,
+box_id           TEXT,
+pickup_location  TEXT,
+delivery_address TEXT,
+assigned_to      TEXT,
+assigned_name    TEXT,
+agent_phone      TEXT,
+status           TEXT,
+was_delayed      BOOLEAN,
+pickup_order     INT,
+item_count       INT,
+notes            TEXT,
+delivery_date    DATE,
+picked_at        BIGINT,
+timestamp        BIGINT,
+archived_at      BIGINT
+```
+
+---
+
+## 4. Firebase / Firestore Limits & Usage
+
+### Firestore Free Tier (Spark Plan)
+| Quota | Limit | This Project's Usage |
+|---|---|---|
+| **Reads / day** | 50,000 | ✅ Very low — `onSnapshot` counts 1 read per document on first sync + 1 per changed doc. 200 customers × 1 = ~200 reads/day for deliveries |
+| **Writes / day** | 20,000 | ✅ Low — each status update by agent = 1 write; 200 deliveries/day ≈ 200–600 writes |
+| **Deletes / day** | 20,000 | ✅ Only on reset day — batch delete of today's deliveries |
+| **Storage** | 1 GB | ✅ Deliveries are cleared daily → Firestore never grows. Only customers + agents stay permanently |
+| **Network egress** | 10 GB/month | ✅ Admin is 1 user; all data is minimal JSON |
+
+### What Was Previously Causing 300,000 Reads (Now Fixed)
+The old `loadHistoryCache()` called `collectionGroup('deliveries').get()` on every dashboard load — fetching ALL historical deliveries from ALL sub-collection days with no filter. This was removed. Historical data is now fetched exclusively from Supabase.
+
+### Firestore Real-Time Listener Pattern
+```
+db.collection('deliveries').where('deliveryDate', '==', today).onSnapshot(...)
+```
+- Reads once on attach (N documents = N reads, where N = today's delivery count)
+- After that: **only changed documents** trigger reads (typically 1 read per agent status update)
+- Costs ~200–500 reads on login, then ~2–5 reads per minute during active delivery hours
+
+### Firebase Auth (Free Tier)
+| Limit | Value |
+|---|---|
+| Monthly active users | 10,000 free |
+| Phone auth | Not used |
+| Email/password | ✅ Used for admin + agents |
+
+> **Agent Auth Note:** Agents are created via REST (`identitytoolkit.googleapis.com/signUp`) not the Admin SDK. This means agents are real Firebase Auth users and can have their password reset via the Firebase console.
+
+---
+
+## 5. Supabase Limits & Usage
+
+### Supabase Free Tier (currently used)
+| Resource | Free Limit | This Project's Usage |
+|---|---|---|
+| **Database storage** | 500 MB | ✅ Each delivery row ≈ 1 KB. 365 days × 200 deliveries × 1 KB = ~70 MB/year |
+| **Row count** | Unlimited rows | ✅ No row limit |
+| **API requests** | 500,000 / month | ✅ Only admin fetches analytics (few hundred requests/month) |
+| **Bandwidth** | 5 GB / month | ✅ Analytics query returns ~1–5 MB max |
+| **Connection pooling** | Port 6543 (Transaction Pooler) | ✅ Used in `backfill-history.js` |
+| **Project pause** | Pauses after 7 days inactivity (free) | ⚠️ Upgrade to Pro ($25/mo) to prevent this |
+
+### Supabase Historical Storage Estimate
+```
+200 customers/day × 365 days = 73,000 rows/year
+Each row ≈ ~1.2 KB
+Total/year ≈ ~87 MB
+```
+→ **Free tier is good for ~5–6 years** of history at current scale.
+
+### Netlify Functions (Serverless)
+| Resource | Free Limit | Usage |
+|---|---|---|
+| Invocations / month | 125,000 | ✅ ~1 invocation/day (reset) + occasional analytics |
+| Function runtime | 10 seconds max | ✅ Sync runs under 3 seconds for 200 deliveries |
+| Background functions | 15 min timeout | Not used |
+
+---
+
+## 6. Agent Limits & Scaling
+
+| Parameter | Current Value | Can Be Changed |
+|---|---|---|
+| Max agents | **No hard limit** in code | Unlimited — each is a Firestore `users` doc |
+| Max deliveries per agent/day | Set per agent via `maxDeliveries` field (default 30) | Editable via Edit Agent modal |
+| Auto-assign algorithm | Zone-first, then load-balanced | Scales automatically with agent count |
+| Real-time status | `onSnapshot` across all agents | Firestore handles fan-out natively |
+
+### Practical Limits
+- **5–20 agents** = perfect (current scale)
+- **20–100 agents** = still works; Firestore handles it, but admin UI may need pagination for agent grid
+- **100+ agents** = consider paginating agents and virtualizing the delivery table
+
+---
+
+## 7. Customer Limits & Scaling
+
+| Parameter | Limit | Notes |
+|---|---|---|
+| Max customers in master list | No code limit | Stored in `customers` collection |
+| UI renders all at once | Works well up to ~2,000 | No virtualization — plain DOM table |
+| Auto-assign reads all active customers | 1 `get()` call | For 1,000 customers = 1,000 reads on one assign click |
+| Daily delivery creation | Batch writes (490 ops/batch) | Handles unlimited — batches auto-split |
+
+**Current practical comfortable range:** 50–500 active customers.
+
+---
+
+## 8. Daily Operations Flow (Step-by-Step)
+
+```
+Morning:
+1. Admin logs in → loadAgents() + listenDeliveries() fire
+2. Admin clicks "Assign Today's Routes"
+   → Reads customers collection (1 get)
+   → Batches delivery docs into Firestore (N writes)
+   → Agents see routes on Android app instantly via onSnapshot
+
+During Delivery (10:30 AM – 1:00 PM):
+3. Each agent status update → 1 Firestore write
+4. Admin dashboard updates in real-time (onSnapshot fires)
+5. Agent Load card + Schools Today card update instantly (no new reads)
+6. Agent card stats update instantly (no new reads — from allDeliveries in memory)
+
+Evening:
+7. Admin clicks "Archive & Reset"
+   → archiveDeliveries(true) collects all delivery docs
+   → POST to /.netlify/functions/sync-history → Supabase transaction
+   → On success: batch delete from Firestore
+   → analyticsLoaded = false (forces re-fetch from Supabase next visit)
+```
+
+---
+
+## 9. History & Analytics Data Flow
+
+```
+DAILY RESET:
+  Firestore deliveries → [Netlify sync-history.js] → Supabase archived_deliveries
+
+ANALYTICS VIEW (Analytics Tab):
+  Supabase archived_deliveries (paginated, 1000 rows/page) +
+  Firestore deliveries (today's live) +
+  Firestore customers (master list)
+  → Merged in memory → Rendered
+
+HISTORY TAB (single day lookup):
+  Supabase archived_deliveries filtered by archive_date
+  (falls back to Firestore history/{date}/deliveries for pre-migration dates)
+```
+
+---
+
+## 10. All JS Modules — Function Inventory
+
+### `firebase-init.js`
+| Function | Purpose |
+|---|---|
+| `getTodayStr()` | Returns `YYYY-MM-DD` for today (local time) |
+| `getTomorrowStr()` | Returns tomorrow's date string |
+| `getYesterdayStr()` | Returns yesterday's date string |
+| `checkAutoSchedule()` | **Disabled** — stub only, no auto resets |
+| `showLoginPage()` / `showDashboard()` | Screen toggle on auth state |
+| `doLogin()` / `doLogout()` | Firebase Auth email/password |
+
+### `agents.js`
+| Function | Purpose |
+|---|---|
+| `loadAgents()` | Fetches all `role=='delivery'` users, builds agent cards and all dropdowns |
+| `updateAgentTodayStats()` | ✅ **NEW** — updates Total/Done/Rate on agent cards from `allDeliveries` (0 extra reads) |
+| `applyAgentPerfToCards(docs)` | Updates agent cards with all-time history data (called by Analytics) |
+| `createAgent()` | Creates Firebase Auth account + Firestore user doc |
+| `openEditAgent(uid)` / `saveAgentEdit()` | Edit agent profile (name, phone, zone, maxDeliveries) |
+
+### `deliveries.js`
+| Function | Purpose |
+|---|---|
+| `listenDeliveries()` | Real-time `onSnapshot` on today's deliveries |
+| `updateStats()` | Updates all KPI cards (Total, Pending, Done, Delayed, NoBox) |
+| `renderDeliveries()` | Renders delivery table with filter/search |
+| `renderDelayed()` | Renders delayed-only table |
+| `renderAgentLoad()` | Renders agent mini-cards on dashboard |
+| `renderSchoolLoad()` | ✅ **NEW** — renders school mini-cards, grouped/normalized by `deliveryAddress` |
+| `renderRecentActivity()` | Renders last 5 activity items (kept in JS, DOM target removed from dashboard — harmless) |
+| `openAgentDeliveries(uid)` | Navigates to deliveries panel filtered to one agent |
+| `doReassign_d()` / `doReassign_dl()` / `_doReassign()` | Reassigns a delivery to a different agent |
+| `getAgentRoute(uid)` | Returns today's sorted route for an agent |
+| `saveRouteOrder()` | Saves manual route reordering (batch write) |
+| `addDelivery()` | Adds a single manual delivery |
+| `markAllDelivered()` | Bulk marks all pending as Delivered (batch, 490 ops/batch) |
+
+### `customers.js`
+| Function | Purpose |
+|---|---|
+| `loadCustomers()` | Fetches all active customers into `allCustomers` |
+| `renderCustomers()` | Renders customer table with filter/sort |
+| `pauseCustomer(id)` | Sets `active: false` (removed from auto-assign) |
+| `deleteCustomer(id, name)` | Deletes from master list (history stays safe in Supabase) |
+| `findBoxIdOwner(boxId, excludeId)` | Checks for box ID conflicts |
+| `openEditCustomer(id)` / `saveCustomerEdit()` | Edit customer details |
+| `importCustomers()` | Excel import via XLSX.js |
+| `addCustomer()` | Manually add a customer |
+
+### `assign.js`
+| Function | Purpose |
+|---|---|
+| `previewAssign()` | Shows preview of what would be assigned |
+| `runAssign(auto)` | Full assignment run (auto=true is disabled/stubbed) |
+| `_assignCustomers(customers, agents)` | Core assignment algorithm: fixed-agent → zone-match → load-balance |
+
+### `history.js`
+| Function | Purpose |
+|---|---|
+| `loadHistory()` | Fetches a single day from Firestore `history/{date}` (legacy) |
+| `archiveDeliveries(includeToday)` | Archives deliveries → Supabase → deletes from Firestore |
+| `triggerReset(auto)` | Manual daily reset with dual confirmation + delivery hours guard |
+| `saveGlobalPin()` / `loadGlobalPin()` | Manage customer app PIN |
+
+### `history_v2.js`
+| Function | Purpose |
+|---|---|
+| `loadHistoryV2()` | Fetches history from Supabase `archived_deliveries` |
+| `filterHistoryTable()` | Client-side filtering of loaded history rows |
+| `fetchIndianHolidays(year)` | Returns holiday map for calendar display (2025–2027 hardcoded) |
+
+### `analytics_v2.js`
+| Function | Purpose |
+|---|---|
+| `fetchArchivedDeliveriesFromSupabase(start, end, scope)` | Paginated Supabase fetch (1,000 rows/page) |
+| `loadAnalyticsV2(forceRefresh)` | Full analytics rebuild: Supabase history + live Firestore + customers |
+| `onAnalyticsScopeChange()` | Triggered on scope dropdown change |
+| `analyticsTab(tab, el)` | Switches between Customers / Agents analytics views |
+| `renderAnalyticsAgentRow(a)` | Renders one agent's analytics row |
+| `openAgentAnalytics(uid)` | Modal with full agent breakdown |
+| `openCustomerAnalytics(id)` | Modal with full customer delivery history |
+
+### `ui.js`
+| Function | Purpose |
+|---|---|
+| `nav(id, el)` | Navigate to a panel (also triggers lazy loads for analytics, inbox, nobox) |
+| `openM(id)` / `closeM(id)` | Open/close modals |
+| `gv(id)` | Get trimmed input value |
+| `escQ(s)` | Escape single quotes for inline HTML |
+| `copyUID(uid)` | Copy agent UID to clipboard |
+| `toast(msg, type)` | 4-second toast notification |
+| `askConfirm(message, options)` | Promise-based confirm modal |
+
+---
+
+## 11. ✅ Safety Audit — Recent Changes
+
+### Change 1: Agent Cards Now Show Today's Stats (agents.js + deliveries.js)
+
+| Concern | Status |
+|---|---|
+| Does it trigger new Firestore reads? | ❌ No — reads from `allDeliveries` (already in memory) |
+| Does it change how `allDeliveries` is populated? | ❌ No — `listenDeliveries()` is unchanged |
+| Does it affect agent creation, edit, or login? | ❌ No — `createAgent()`, `openEditAgent()`, `saveAgentEdit()` are untouched |
+| Does it affect the delivery assignment flow? | ❌ No — `runAssign()` and `_assignCustomers()` are untouched |
+| Does it affect the daily reset / archive? | ❌ No — `triggerReset()` and `archiveDeliveries()` are untouched |
+| Does `updateAgentTodayStats()` replace any old function? | ❌ No — `applyAgentPerfToCards()` still exists and still gets called from Analytics |
+| Is `allDeliveries` guaranteed to exist when it runs? | ✅ Yes — it's initialized as `[]` in `firebase-init.js` and the function guards with `|| []` |
+
+### Change 2: Schools Today Card (index.html + deliveries.js)
+
+| Concern | Status |
+|---|---|
+| Does it remove `renderRecentActivity()`? | ❌ No — function still exists in deliveries.js |
+| Does it break any other panel or tab? | ❌ No — `recentActivity` DOM element is just gone from dashboard; function is harmless if no target |
+| Does it change `listenDeliveries()` behavior? | ❌ No — just added `renderSchoolLoad()` to the existing callback chain |
+| Does `renderSchoolLoad()` make any Firestore calls? | ❌ No — pure in-memory computation from `allDeliveries` |
+| Does normalization affect data in Firestore? | ❌ No — `deliveryAddress` is never written; only read for display grouping |
+| Does it affect the Deliveries tab, Auto Assign, History, or Analytics? | ❌ No — completely isolated to the dashboard overview panel |
+| What if `deliveryAddress` is empty? | ✅ Handled — falls back to `'unknown'` key → shows as "Unknown School" card |
+
+---
+
+## 12. Scalability Rating Summary
+
+| Dimension | Current Scale | Comfortable Limit | Beyond Limit Action Needed |
+|---|---|---|---|
+| Active customers | ~100–200 | ~2,000 | Paginate customer table |
+| Delivery agents | 3–10 | ~50 | Paginate agent grid |
+| Daily deliveries | 100–300 | ~5,000 | Virtualize delivery table |
+| History storage (Supabase) | ~1 MB/month | 500 MB free | Upgrade to Supabase Pro |
+| Firestore reads/day | ~500–2,000 | 50,000 (free) | Well within budget |
+| Firestore writes/day | ~200–1,000 | 20,000 (free) | Well within budget |
+| Schools | 1 | Unlimited | Already handled — auto-adds new cards |
+| Agents (Firebase Auth users) | 3–10 | 10,000 free | Well within budget |
+
+---
+
+## 13. Known Limitations & Watchpoints
+
+> [!WARNING]
+> **Supabase Free Tier pauses** after 7 days of inactivity. If the admin doesn't visit for a week, the Supabase project may pause and history/analytics will fail until manually unpaused. Upgrade to Supabase Pro ($25/mo) to prevent this.
+
+> [!NOTE]
+> **`deliveryAddress` is the school name field.** There is no separate `schoolName` field in Firestore. The `renderSchoolLoad()` function reads `deliveryAddress` and normalizes it. If an address is entered inconsistently (e.g., a house address), it will appear as a school card. Ensure all deliveries use school names as the delivery address.
+
+> [!NOTE]
+> **Firebase Analytics / FCM not used.** Agent push notifications are prepared (`fcmToken` is stored) but push sending is not currently wired up in the admin panel.
+
+> [!TIP]
+> **The delivery hours guard (10:30 AM – 1:00 PM)** in both `triggerReset()` and `runAssign()` protects against accidental resets mid-delivery. It prompts an extra warning but does NOT block the action — admin can still proceed.
+
+---
+
+## 14. File Map
+
+| File | Location | Size |
+|---|---|---|
+| Main HTML | `index.html` | ~1,248 lines |
+| CSS | `project/css/admin.css` | ~1,861 lines |
+| Firebase Init + Auth | `project/js/firebase-init.js` | 102 lines |
+| UI Navigation | `project/js/ui.js` | 169 lines |
+| Deliveries (live) | `project/js/deliveries.js` | 283 lines |
+| Agents | `project/js/agents.js` | 137 lines |
+| Customers | `project/js/customers.js` | 215 lines |
+| Auto Assign | `project/js/assign.js` | 144 lines |
+| History (Firestore legacy) | `project/js/history.js` | 237 lines |
+| History v2 (Supabase) | `project/js/history_v2.js` | 266 lines |
+| Analytics v2 | `project/js/analytics_v2.js` | 265 lines |
+| Export (Excel) | `project/js/export.js` | — |
+| Inbox | `project/js/inbox.js` | — |
+| No Box Requests | `project/js/nobox.js` | — |
+| Broadcast | `project/js/broadcast.js` | — |
+| Netlify: Daily sync | `netlify/functions/sync-history.js` | 99 lines |
+| Netlify: Backfill | `netlify/functions/backfill-history.js` | 111 lines |
+| Netlify: Analytics | `netlify/functions/analytics-history.js` | — |
+| Netlify: Weekly trend | `netlify/functions/weekly-trend.js` | — |
+
+---
+
+*Generated: 2026-10-05 | Lunchbox Admin v2 | Project: lunchboxdelivery-3d673*

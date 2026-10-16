@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════
+# SECRETS & ENVIRONMENT
+# ═══════════════════════════════════════
+.env
+.env.js
+.env.local
+.env.*.local
+
+# ═══════════════════════════════════════
+# OS GENERATED FILES
+# ═══════════════════════════════════════
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ═══════════════════════════════════════
+# EDITOR / IDE
+# ═══════════════════════════════════════
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# ═══════════════════════════════════════
+# NODE (if added later)
+# ═══════════════════════════════════════
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# ═══════════════════════════════════════
+# BUILD / DEPLOY ARTIFACTS
+# ═══════════════════════════════════════
+dist/
+build/
+*.log
